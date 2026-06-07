@@ -1,0 +1,14 @@
+venv/ 
+env/ 
+__pycache__/ 
+*.pyc 
+.vscode/ 
+.env 
+chroma_db/ 
+models/ 
+cache/ 
+.ipynb_checkpoints/
+tables/
+output/
+temp_images/
+uploads/
