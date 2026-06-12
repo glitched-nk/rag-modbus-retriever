@@ -52,7 +52,7 @@ def _tables_are_compatible(a: dict, b: dict) -> bool:
     if any(kw in first_row_text for kw in header_keywords):
         return False
  
-    addr_pat = re.compile(r"^\d{2,7}$")
+    addr_pat = re.compile(r"^\d{3,7}$")
     return any(addr_pat.match(cell.strip()) for cell in first_row_values) 
  
 def merge_continued_tables(tables: list) -> list:
@@ -81,8 +81,7 @@ def merge_continued_tables(tables: list) -> list:
             }
     merged.append(current)
 
-    print(f"    [merge] {len(tables)} raw tables "
-        f"-> {len(merged)} after merging")
+    print(f"    [merge] {len(tables)} raw tables -> {len(merged)} after merging")
     return merged
 
 #if useful tables exist
@@ -203,9 +202,7 @@ def _run_llm_identification(all_text, user_company, user_family, user_rack):
  
     if not device_rack:
         print("  [LLM] Identifying device rack (1 API call)...")
-        rack_info = identify_device_rack_from_text(
-            all_text, company, device_family, device_rack
-        )
+        rack_info = identify_device_rack_from_text(all_text, company, device_family, device_rack)
         print(f"         {rack_info}")
         if rack_info.get("device_rack"):
             device_rack = rack_info["device_rack"]
@@ -252,7 +249,77 @@ def _keyword_search_rack(context: str, target_rack: str) -> tuple:
  
     return ("miss", "")
 
-def _resolve_table_rack(context: str, company: str, device_family: str, target_rack: str, fallback_rack: str) -> tuple:
+def _resolve_table_rack(context, company, device_family, target_rack, fallback_rack) -> tuple:
+    global _last_known_rack
+
+    if not context or not context.strip():
+        rack = _last_known_rack or fallback_rack
+        print(f"    [rack] No context — using last known / fallback '{rack}'")
+        return rack, True
+
+    if target_rack:
+        hit_type, found_rack = _keyword_search_rack(context, target_rack)
+ 
+        if hit_type in ("found", "partial"):
+            _last_known_rack = found_rack
+            print(f"    [rack] Keyword {hit_type} → '{found_rack}'")
+            return found_rack, True
+
+        if _last_known_rack:
+            if _racks_match(_last_known_rack, target_rack):
+                print(f"    [rack] Keyword miss — inheriting last known rack '{_last_known_rack}' (no LLM call)")
+                return _last_known_rack, True
+            else:
+                print(f"    [rack] Keyword miss — last known rack is '{_last_known_rack}' ≠ target '{target_rack}' → SKIP")
+                return _last_known_rack, False
+
+        print(f"    [rack] Keyword miss, no prior context — calling LLM...")
+        try:
+            result = identify_rack_from_context(context, company, device_family, fallback_rack)
+            table_rack = result.get("device_rack") or fallback_rack
+            confidence = result.get("confidence", "low")
+        except Exception as e:
+            print(f"    [rack] LLM error: {e} — using fallback")
+            table_rack = fallback_rack
+            confidence = "low"
+
+        print(f"    [rack] LLM → '{table_rack}' (confidence: {confidence})")
+
+        if _racks_match(table_rack, target_rack):
+            _last_known_rack = table_rack
+            return table_rack, True
+        if confidence == "low":
+            print(f"    [rack] Low confidence mismatch — including anyway")
+            return fallback_rack, True
+        print(f"    [rack] SKIP — '{table_rack}' ≠ target '{target_rack}'")
+        return table_rack, False
+    
+    hit_type, _ = ("miss", "")   # keyword search meaningless without target
+    heading_keywords = ["register", "modbus", "map", "section", "table", "chapter", "device", "meter", "model", "type"]
+    context_lower = context.lower()
+    has_heading= any(kw in context_lower for kw in heading_keywords)
+ 
+    if not has_heading and _last_known_rack:
+        # Continuation table, reuse last known rack, no LLM call
+        print(f"    [rack] No heading in context — inheriting '{_last_known_rack}'")
+        return _last_known_rack, True
+ 
+    # New section (heading detected) or no prior rack — call LLM
+    try:
+        result     = identify_rack_from_context(context, company, device_family, fallback_rack)
+        table_rack = result.get("device_rack") or fallback_rack
+        confidence = result.get("confidence", "low")
+    except Exception as e:
+        print(f"    [rack] LLM error: {e} — using fallback")
+        table_rack = fallback_rack
+        confidence = "low"
+ 
+    print(f"    [rack] LLM → '{table_rack}' (confidence: {confidence})")
+    if table_rack:
+        _last_known_rack = table_rack
+    return table_rack, True
+
+'''def _resolve_table_rack(context: str, company: str, device_family: str, target_rack: str, fallback_rack: str) -> tuple:
     if not context or not context.strip():
         print(f"    [rack] No context — using fallback '{fallback_rack}'")
         return fallback_rack, True
@@ -298,7 +365,8 @@ def _resolve_table_rack(context: str, company: str, device_family: str, target_r
         confidence = "low"
     
     print(f"    [rack] LLM identified: '{table_rack}' (confidence: {confidence})")
-    return table_rack, True
+    return table_rack, True 
+'''
 
 ## main program 
 def main():
@@ -528,9 +596,41 @@ def main():
         print("No registers found in DB for those keys. Check rack name matching.")
         return
     
-    register_rows = [{"label": r[0], "address": r[1], "datatype": r[2], "description": r[3]}
-                    for r in registers]
+    #register_rows = [{"label": r[0], "address": r[1], "datatype": r[2], "description": r[3]}
+    #                for r in registers]
+
+    seen_addresses  = set()
+    header_patterns = {"address", "register", "parameter", "description",
+                       "data type", "datatype", "type", "label"}
+    register_rows   = []
  
+    for r in registers:
+        label, address, datatype, description = r
+        if description.strip().lower() in header_patterns:
+            continue
+        if address.strip().lower() in header_patterns:
+            continue
+ 
+        # Deduplicate on address — first-seen wins
+        if address in seen_addresses:
+            continue
+        seen_addresses.add(address)
+ 
+        register_rows.append({
+            "label":       label,
+            "address":     address,
+            "datatype":    datatype,
+            "description": description,
+        })
+ 
+    before = len(registers)
+    after  = len(register_rows)
+    if before != after:
+        print(f"  [dedup] {before} rows -> {after} after final deduplication "
+              f"({before - after} removed)")
+    else:
+        print(f"  {after} unique register(s) ready for formatting")
+
     print("Formatting with LLM...")
     json_output = generate_json(register_rows, company, device_family)
  
