@@ -5,10 +5,16 @@ from langchain_openai import ChatOpenAI
 
 # $env:OPENAI_API_KEY="key"  -> need to set in terminal
 
-llm = ChatOpenAI(
-    api_key=os.getenv("OPENAI_API_KEY"),
-    model="gpt-4o-mini"
-)
+def _get_llm():
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "OPENAI_API_KEY is not set. "
+            "Run:  $env:OPENAI_API_KEY='sk-...'  (PowerShell) "
+            "or    set OPENAI_API_KEY=sk-...      (CMD) "
+            "in your terminal before starting the program."
+        )
+    return ChatOpenAI(api_key=api_key, model="gpt-4o-mini")
 
 _DTYPE_MAP = {
     # 32-bit floats
@@ -130,7 +136,7 @@ Input data (fields prefixed with _ are pre-filled system values):
 Return ONLY a valid JSON array. No markdown, no explanation, no extra text.
 """
 
-        response = llm.invoke(prompt)
+        response = _get_llm().invoke(prompt)
         raw = response.content.strip()
 
         # Strip markdown code fences if present

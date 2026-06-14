@@ -2,10 +2,16 @@ import os
 import json
 from langchain_openai import ChatOpenAI
 
-llm = ChatOpenAI(
-    api_key=os.getenv("OPENAI_API_KEY"),
-    model="gpt-4o-mini"
-)
+def _get_llm():
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "OPENAI_API_KEY is not set. "
+            "Run:  $env:OPENAI_API_KEY='sk-...'  (PowerShell) "
+            "or    set OPENAI_API_KEY=sk-...      (CMD) "
+            "in your terminal before starting the program."
+        )
+    return ChatOpenAI(api_key=api_key, model="gpt-4o-mini")
 
 def identify_device_from_text(raw_text: str, user_company: str = "", user_family: str = "") -> dict:
     prompt = f"""You are analyzing a Modbus register map document.
@@ -32,7 +38,7 @@ Return ONLY a JSON object with these exact keys (no markdown, no explanation):
 }}
 """
     
-    response = llm.invoke(prompt)
+    response = _get_llm().invoke(prompt)
     raw = response.content.strip()
  
     # Strip accidental markdown fences
@@ -76,7 +82,7 @@ Return ONLY a JSON object:
 }}
 """
     
-    response = llm.invoke(prompt)
+    response = _get_llm().invoke(prompt)
     raw = response.content.strip()
     
     if raw.startswith("```"):
@@ -124,7 +130,7 @@ Rules:
 Return ONLY a JSON object, no markdown:
 {{"device_rack": "", "confidence": "high|medium|low"}}
 """
-    response = llm.invoke(prompt)
+    response = _get_llm().invoke(prompt)
     raw = response.content.strip()
     
     if raw.startswith("```"):
