@@ -118,7 +118,7 @@ def extract_table_rows_from_image(image_path: str, y_band: int = 15) -> list:
     return [[cell[1] for cell in row] for row in rows]
  
 #filtering rows 
-PATTERN = re.compile(r"^\d{3,6}$")
+PATTERN = re.compile(r"^\d{3,7}$")
  
 def filter_register_rows(rows: list) -> list:
     result = []

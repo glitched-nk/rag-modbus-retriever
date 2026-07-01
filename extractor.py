@@ -1,9 +1,27 @@
 import os
+import re
 import fitz
 import pdfplumber
 import pandas as pd
 from docx import Document
 from PIL import Image
+
+def decode_cid(text) -> str:
+    """Replace every (cid:N) token in text with chr(N).
+    Returns an empty string for None input."""
+    if text is None:
+        return ""
+    s = str(text)
+    if "(cid:" not in s:
+        return s
+    return re.sub(r'\(cid:(\d+)\)', lambda m: chr(int(m.group(1))), s)
+
+
+def decode_cid_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    try:
+        return df.map(decode_cid)
+    except AttributeError:
+        return df.applymap(decode_cid)
 
 #Return all text from a PDF using pdfplumber.
 #Returns an empty string if the PDF has no text layer (scanned/image PDF)
@@ -14,7 +32,7 @@ def extract_pdf_text(pdf_path: str) -> str:
             for page in pdf.pages:
                 extracted = page.extract_text()
                 if extracted:
-                    text += extracted + "\n"
+                    text += decode_cid(extracted) + "\n"
     except Exception as e:
         print(f"[extractor] pdfplumber error on {pdf_path}: {e}")
     return text
@@ -25,7 +43,7 @@ def extract_pdf_pages_with_text(pdf_path: str) -> dict:
         with pdfplumber.open(pdf_path) as pdf:
             for i, page in enumerate(pdf.pages):
                 t = page.extract_text()
-                page_texts[i] = t if t else ""
+                page_texts[i] = decode_cid(t) if t else ""
     except Exception as e:
         print(f"[extractor] page text extraction error: {e}")
     return page_texts

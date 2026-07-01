@@ -16,6 +16,7 @@ def retrieve_registers(company: str, family: str, rack: str, doc_hash: str | Non
                 r["address"],
                 r["datatype"],
                 r["description"],
+                r["scaling"],
             ))
  
     if len(deduped) < len(rows):

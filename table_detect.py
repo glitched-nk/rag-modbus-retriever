@@ -142,36 +142,85 @@ COLUMN_HINTS = {
     "description": ["parameter", "description", "parameters", "name", "register name", "object name", "label", "variable",
                     "details", "meaning", "function"],
     "datatype": ["data type", "datatype", "type", "format", "data format"],
+    "num_registers": ["number of registers", "no of registers", "no. of registers", "num registers", "register count", "reg count", 
+                    "length", "len", "size", "word count", "word length"],
     "serial": ["sl.no", "sl no", "no.", "no", "s.no", "sr.no", "index"],
     "unit": ["unit", "units"],
     "scaling": ["scaling", "scale", "factor", "multiplier"],
 }
- 
+
+def _hint_match_score(text: str, hint: str) -> int:
+    if hint not in text:
+        return 0
+    if text.strip() == hint:
+        return 3
+    if re.search(rf"\b{re.escape(hint)}\b", text):
+        return 2
+    return 1
+
+
+def _best_hint_column(col_texts: dict, hints: list, exclude: set) -> int:
+    best_col, best_score = -1, 0
+    for col_idx, text in col_texts.items():
+        if col_idx in exclude:
+            continue
+        col_best = max((_hint_match_score(text, h) for h in hints), default=0)
+        if col_best > best_score:
+            best_score, best_col = col_best, col_idx
+    return best_col if best_score > 0 else -1
+
+
+def _address_column_is_valid(df: pd.DataFrame, col_idx: int) -> bool:
+    if col_idx == -1:
+        return False
+    addr_pat = re.compile(r"^\d{3,7}$")
+    sample = df.iloc[:, col_idx].astype(str).str.strip()
+    matches = sample.apply(lambda v: bool(addr_pat.match(v))).sum()
+    return matches >= 3
+
 def detect_modbus_columns(df: pd.DataFrame) -> dict:
-    header_rows = min(5, len(df))
+    '''header_rows = min(5, len(df))
     col_texts = {}
     for col_idx in range(df.shape[1]):
-        combined = " ".join(str(df.iloc[r, col_idx]) for r in range(header_rows)    ).lower()
-        col_texts[col_idx] = combined
+        combined = " ".join(str(df.iloc[r, col_idx]) for r in range(header_rows)).lower()
+        col_texts[col_idx] = combined'''
+    
+    col_texts = {}
+    for col_idx in range(df.shape[1]):
+        col_texts[col_idx] = str(df.iloc[0, col_idx]).lower()
  
     roles = {role: -1 for role in COLUMN_HINTS}
- 
-    for role, hints in COLUMN_HINTS.items():
-        for col_idx, text in col_texts.items():
-            if any(hint in text for hint in hints):
-                roles[role] = col_idx
-                break
+    assigned: set = set()
 
-    # Fallback: if address still not found, look for the first column whose DATA rows contain 4-5 digit numbers
+    candidate = _best_hint_column(col_texts, COLUMN_HINTS["address"], assigned)
+    if candidate != -1 and _address_column_is_valid(df, candidate):
+        roles["address"] = candidate
+        assigned.add(candidate)
+        
+    for role, hints in COLUMN_HINTS.items():
+        if role == "address":
+            continue
+        candidate = _best_hint_column(col_texts, hints, assigned)
+        if candidate != -1:
+            roles[role] = candidate
+            assigned.add(candidate)
+
     if roles["address"] == -1:
-        addr_pat = re.compile(r"^\d{3,6}$")
+        addr_pat = re.compile(r"^\d{3,7}$")
+        best_col, best_hits = -1, 0
         for col_idx in range(df.shape[1]):
-            col = df.iloc[min(5, len(df)):, col_idx].astype(str).str.strip()
-            if col.apply(lambda v: bool(addr_pat.match(v))).sum() >= 3:
-                roles["address"] = col_idx
-                break
-    if roles["description"] == -1:      #check if necessary
-        assigned = {v for v in roles.values() if v != -1}
+            if col_idx in assigned:
+                continue
+            col = df.iloc[:, col_idx].astype(str).str.strip()
+            hits = col.apply(lambda v: bool(addr_pat.match(v))).sum()
+            if hits >= 3 and hits > best_hits:
+                best_hits, best_col = hits, col_idx
+        if best_col != -1:
+            roles["address"] = best_col
+            assigned.add(best_col)
+            print(f"    [detect_columns] address fallback (data scan) → col {best_col}")
+
+    if roles["description"] == -1:
         best_col, best_len = -1, 0
         data_start = find_data_start_row(df, roles)
         for col_idx in range(df.shape[1]):
@@ -189,7 +238,7 @@ def find_data_start_row(df: pd.DataFrame, roles: dict) -> int:
     addr_col = roles.get("address", -1)
     if addr_col == -1:
         return 1  # best guess
-    addr_pat = re.compile(r"^\d{3,6}$")
+    addr_pat = re.compile(r"^\d{3,7}$")
     for row_idx in range(len(df)):
         val = str(df.iloc[row_idx, addr_col]).strip()
         if addr_pat.match(val):

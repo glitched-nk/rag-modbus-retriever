@@ -85,7 +85,7 @@ SCHEMA_EXAMPLE = """[
     "Address": "1",
     "Format": "Float",
     "Number of registers": 2,
-    "Scaling": 1,
+    "Scaling": 1,"
     "Multiplier": 1,
     "Description": "Voltage Va-n",
     "Display Name": null

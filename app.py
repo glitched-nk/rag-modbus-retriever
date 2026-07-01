@@ -12,10 +12,11 @@ from extractor import *
 from ocr import *
 from table_detect import *
 from database import *
-from retriever import retrieve_registers
+#from retriever import retrieve_registers
 from llm_identifier import identify_device_from_text, identify_device_rack_from_text, identify_rack_from_context
-from llm_formatter import generate_json
+from json_formatter import generate_json
 from json_export import save_json
+from ocr_llm_fallback import *
 
 UPLOAD_FOLDER  = "uploads"
 IMAGE_FOLDER   = "temp_images"
@@ -127,30 +128,108 @@ def _validate_roles(roles: dict, label: str) -> bool:
     if roles.get("description", -1) == -1:
         print(f"  [WARN] {label}: description column not detected.")
     return True
- 
-def _insert_rows_from_table(df, roles, start_row, company, device_family, device_rack, doc_hash) -> int :
-    addr_col = roles.get("address", -1)
-    desc_col = roles.get("description", -1)
-    type_col = roles.get("datatype", -1)
+
+def _looks_like_address(value: str) -> bool:
+    if not value:
+        return False
+    cleaned = value.strip().replace(",", "")
+    if cleaned.endswith(".0"):
+        cleaned = cleaned[:-2]
+    if not cleaned.isdigit():
+        return False
+    return 3 <= len(cleaned) <= 7
+
+def _clean_address(value: str) -> str:
+    cleaned = value.strip().replace(",", "")
+    if cleaned.endswith(".0"):
+        cleaned = cleaned[:-2]
+    return cleaned
+
+def _find_best_address_column(df, start_row: int) -> int:
+
+    n_rows = len(df) - start_row
+    if n_rows <= 0:
+        return -1
+
+    best_col, best_score = -1, 0.0
+    for col_idx in range(df.shape[1]):
+        hits = 0
+        for i in range(start_row, len(df)):
+            cell = str(df.iloc[i, col_idx]).strip()
+            if _looks_like_address(cell):
+                hits += 1
+        score = hits / n_rows
+        if score > best_score:
+            best_score, best_col = score, col_idx
+
+    # Require at least half the rows to look like addresses before trusting this column as a genuine address column
+    return best_col if best_score >= 0.5 else -1
+
+
+def _try_insert_with_column(df, start_row, addr_col, desc_col, type_col, scaling_col, num_regs_col, company, device_family, device_rack, doc_hash, dry_run: bool) -> tuple:
+
     inserted = skipped = 0
 
     for i in range(start_row, len(df)):
         row = df.iloc[i]
-        address = str(row.iloc[addr_col]).strip() if addr_col != -1 else ""
+        raw_address = str(row.iloc[addr_col]).strip() if addr_col != -1 else ""
         description = str(row.iloc[desc_col]).strip() if desc_col != -1 else ""
-        datatype = str(row.iloc[type_col]).strip() if type_col != -1 else "Unknown"
-        if not address or not address.isdigit():
+        datatype    = str(row.iloc[type_col]).strip() if type_col != -1 else "Unknown"
+        scaling     = str(row.iloc[scaling_col]).strip() if scaling_col != -1 else None
+        if scaling is not None and scaling.lower() in ("", "nan", "none"):
+            scaling = None
+        
+        num_registers = str(row.iloc[num_regs_col]).strip() if num_regs_col != -1 else None
+        if num_registers is not None and num_registers.lower() in ("", "nan", "none"):
+            num_registers = None
+        
+        if not _looks_like_address(raw_address):
             skipped += 1
             continue
-        #if description.lower() in ("", "nan", "none"):
-            #skipped += 1
-            #continue
-        insert_register_v2(company, device_family, device_rack, doc_hash, _make_label(description), address, datatype, description)
+
+        address = _clean_address(raw_address)
+
+        if not dry_run:
+            insert_register_v2(company, device_family, device_rack, doc_hash, _make_label(description), address, datatype, description, scaling, num_registers)
         inserted += 1
+
+    return inserted, skipped
+
+
+def _insert_rows_from_table(df, roles, start_row, company, device_family, device_rack, doc_hash) -> int :
+    addr_col = roles.get("address", -1)
+    desc_col = roles.get("description", -1)
+    type_col = roles.get("datatype", -1)
+    scaling_col = roles.get("scaling", -1)
+    num_regs_col = roles.get("num_registers", -1)
+
+    # First pass with the column detect_modbus_columns() chose
+    inserted, skipped = _try_insert_with_column(df, start_row, addr_col, desc_col, type_col, scaling_col, num_regs_col,
+        company, device_family, device_rack, doc_hash, dry_run=True)
+
+    # Auto-correction: if every row failed, the detected column is wrong — re-scan all columns for the one that actually looks like addresses.
+    if inserted == 0 and skipped > 0:
+        sample = [str(df.iloc[start_row + i, addr_col]) if addr_col != -1 else ""
+                  for i in range(min(3, len(df) - start_row))]
+        print(f"    [address-fix] Detected address column {addr_col} produced "
+              f"0 valid rows out of {skipped}. Sample values: {sample}")
+
+        corrected_col = _find_best_address_column(df, start_row)
+        if corrected_col != -1 and corrected_col != addr_col:
+            print(f"    [address-fix] Re-routing address column "
+                  f"{addr_col} → {corrected_col} and retrying.")
+            addr_col = corrected_col
+        else:
+            print("    [address-fix] No alternative column qualifies "
+                  "(need ≥50% address-shaped values) — leaving as-is.")
+
+    # Real insert pass (with corrected column if applicable)
+    inserted, skipped = _try_insert_with_column(df, start_row, addr_col, desc_col, type_col, scaling_col, num_regs_col,
+        company, device_family, device_rack, doc_hash, dry_run=False)
+
     print(f"    Inserted {inserted}, skipped {skipped}")
     return inserted
- 
- 
+
 def _insert_rows_from_ocr(ocr_rows, company, device_family, device_rack, doc_hash) -> int:
     import re
     addr_pat = re.compile(r"^\d{3,7}$")
@@ -177,9 +256,26 @@ def _insert_rows_from_ocr(ocr_rows, company, device_family, device_rack, doc_has
         description = max(remaining, key=lambda t: len(t[1]))[1].strip()
         if not description:
             continue
-        insert_register(company, device_family, device_rack, doc_hash, _make_label(description), address, datatype, description)
+        insert_register(company, device_family, device_rack, _make_label(description), address, datatype, description, doc_hash, scaling= None, num_registers=None)
         inserted += 1
     print(f"    OCR inserted {inserted} rows")
+    return inserted
+
+def _insert_rows_from_llm_fallback(llm_rows: list, company, device_family, device_rack, doc_hash) -> int:
+    inserted = 0
+    for row in llm_rows:
+        address = row.get("address", "")
+        description = row.get("description", "")
+        if not address or not description:
+            continue
+        insert_register_v2(
+            company, device_family, device_rack, doc_hash,
+            _make_label(description), address,
+            row.get("datatype") or "Unknown", description,
+            row.get("scaling"), row.get("num_registers"),
+        )
+        inserted += 1
+    print(f"    LLM fallback inserted {inserted} rows")
     return inserted
 
 def _collect_all_text(files: list) -> str:
@@ -242,7 +338,8 @@ def _run_llm_identification(all_text, user_company, user_family, user_rack):
  
     return company, device_family, device_rack
 
-_last_known_rack: str = ""
+def _new_rack_state() -> dict:
+    return {"last_known_rack": ""}
 
 def _keyword_search_rack(context: str, target_rack: str) -> tuple:
     if not context or not target_rack:
@@ -282,62 +379,42 @@ def _keyword_search_rack(context: str, target_rack: str) -> tuple:
  
     return ("miss", "")
 
-def _resolve_table_rack(context, company, device_family, target_rack, fallback_rack) -> tuple:
-    global _last_known_rack
-
+def _resolve_table_rack(context, company, device_family, target_rack, fallback_rack, rack_state) -> tuple:
     if not context or not context.strip():
-        rack = _last_known_rack or fallback_rack
-        print(f"    [rack] No context — using last known / fallback '{rack}'")
-        return rack, True
+        print(f"    [rack] No context for this table — cannot confirm "
+              f"'{target_rack or fallback_rack}' → SKIP")
+        return (target_rack or fallback_rack), False
 
     if target_rack:
         hit_type, found_rack = _keyword_search_rack(context, target_rack)
- 
+
         if hit_type in ("found", "partial"):
-            _last_known_rack = found_rack
+            rack_state["last_known_rack"] = found_rack
             print(f"    [rack] Keyword {hit_type} → '{found_rack}'")
             return found_rack, True
 
-        if _last_known_rack:
-            if _racks_match(_last_known_rack, target_rack):
-                print(f"    [rack] Keyword miss — inheriting last known rack '{_last_known_rack}' (no LLM call)")
-                return _last_known_rack, True
-            else:
-                print(f"    [rack] Keyword miss — last known rack is '{_last_known_rack}' ≠ target '{target_rack}' → SKIP")
-                return _last_known_rack, False
-
-        print(f"    [rack] Keyword miss, no prior context — calling LLM...")
+        print("    [rack] Keyword miss in this table's context — calling LLM "
+              "for an independent check (no inheritance)...")
         try:
-            result = identify_rack_from_context(context, company, device_family, fallback_rack)
-            table_rack = result.get("device_rack") or fallback_rack
+            result     = identify_rack_from_context(context, company, device_family, fallback_rack)
+            table_rack = result.get("device_rack") or ""
             confidence = result.get("confidence", "low")
         except Exception as e:
-            print(f"    [rack] LLM error: {e} — using fallback")
-            table_rack = fallback_rack
+            print(f"    [rack] LLM error: {e} — treating as unconfirmed")
+            table_rack = ""
             confidence = "low"
 
-        print(f"    [rack] LLM → '{table_rack}' (confidence: {confidence})")
+        print(f"    [rack] LLM → '{table_rack or '(none)'}' (confidence: {confidence})")
 
-        if _racks_match(table_rack, target_rack):
-            _last_known_rack = table_rack
+        if table_rack and _racks_match(table_rack, target_rack) and confidence != "low":
+            rack_state["last_known_rack"] = table_rack
             return table_rack, True
-        if confidence == "low":
-            print(f"    [rack] Low confidence mismatch — including anyway")
-            return fallback_rack, True
-        print(f"    [rack] SKIP — '{table_rack}' ≠ target '{target_rack}'")
-        return table_rack, False
-    
-    hit_type, _ = ("miss", "")   # keyword search meaningless without target
-    heading_keywords = ["register", "modbus", "map", "section", "table", "chapter", "device", "meter", "model", "type"]
-    context_lower = context.lower()
-    has_heading= any(kw in context_lower for kw in heading_keywords)
- 
-    if not has_heading and _last_known_rack:
-        # Continuation table, reuse last known rack, no LLM call
-        print(f"    [rack] No heading in context — inheriting '{_last_known_rack}'")
-        return _last_known_rack, True
- 
-    # New section (heading detected) or no prior rack — call LLM
+
+        print(f"    [rack] No fresh confirmation for '{target_rack}' in this "
+              f"table's own context → SKIP (likely a merge gap or different "
+              f"rack's section)")
+        return (table_rack or target_rack), False
+
     try:
         result     = identify_rack_from_context(context, company, device_family, fallback_rack)
         table_rack = result.get("device_rack") or fallback_rack
@@ -346,64 +423,15 @@ def _resolve_table_rack(context, company, device_family, target_rack, fallback_r
         print(f"    [rack] LLM error: {e} — using fallback")
         table_rack = fallback_rack
         confidence = "low"
- 
+
     print(f"    [rack] LLM → '{table_rack}' (confidence: {confidence})")
     if table_rack:
-        _last_known_rack = table_rack
+        rack_state["last_known_rack"] = table_rack
     return table_rack, True
 
-'''def _resolve_table_rack(context: str, company: str, device_family: str, target_rack: str, fallback_rack: str) -> tuple:
-    if not context or not context.strip():
-        print(f"    [rack] No context — using fallback '{fallback_rack}'")
-        return fallback_rack, True
-    
-    if target_rack:
-        hit_type, found_rack = _keyword_search_rack(context, target_rack)
- 
-        if hit_type == "found":     #no LLM
-            return found_rack, True
- 
-        if hit_type == "partial":       #uncertain, nut no LLM
-            print(f"    [rack] Partial keyword match — accepting '{found_rack}'")
-            return found_rack, True
-        
-        print(f"    [rack] Keyword miss — falling back to LLM...")
-        try:
-            result = identify_rack_from_context(context, company, device_family, fallback_rack)
-            table_rack = result.get("device_rack") or fallback_rack
-            confidence = result.get("confidence", "low")
-        except Exception as e:
-            print(f"    [rack] LLM error: {e} — using fallback")
-            table_rack = fallback_rack
-            confidence = "low"
-        
-        print(f" [rack] LLM identified: '{table_rack}' (confidence: {confidence})")
-
-        if _racks_match(table_rack, target_rack):
-            return table_rack, True
-        if confidence == "low":
-            print(f"    [rack] Low confidence mismatch — including anyway")
-            return fallback_rack, True
-        print(f"    [rack] SKIP — '{table_rack}' ≠ target '{target_rack}'")
-        return table_rack, False
-    
-    #no target rack given by user
-    try:
-        result = identify_rack_from_context(context, company, device_family, fallback_rack)
-        table_rack = result.get("device_rack") or fallback_rack
-        confidence = result.get("confidence", "low")
-    except Exception as e:
-        print(f"    [rack] LLM error: {e} — using fallback")
-        table_rack = fallback_rack
-        confidence = "low"
-    
-    print(f"    [rack] LLM identified: '{table_rack}' (confidence: {confidence})")
-    return table_rack, True 
-'''
-
-def _process_pdf(file_path, file_name, company, device_family,
-                 target_rack, fallback_rack, doc_hash) -> int:
+def _process_pdf(file_path, file_name, company, device_family, target_rack, fallback_rack, doc_hash) -> int:
     total    = 0
+    rack_state = _new_rack_state()
     raw_text = extract_pdf_text(file_path)
     scanned  = is_scanned_pdf(file_path) or len(raw_text.strip()) < 50
  
@@ -419,7 +447,10 @@ def _process_pdf(file_path, file_name, company, device_family,
             raw_tables = extract_tables_from_pdfplumber(file_path, page_texts)
  
         print(f"  {len(raw_tables)} raw table(s) found")
- 
+
+        for t in raw_tables:
+            t["table"] = decode_cid_dataframe(t["table"])
+
         # Populate gap_text_before on each table dict before merging
         raw_tables    = enrich_tables_with_gap_text(raw_tables, page_texts)
         tables        = merge_continued_tables(raw_tables)
@@ -437,7 +468,7 @@ def _process_pdf(file_path, file_name, company, device_family,
                 continue
  
             try:
-                table_rack, should_insert = _resolve_table_rack(context, company, device_family, target_rack, fallback_rack)
+                table_rack, should_insert = _resolve_table_rack(context, company, device_family, target_rack, fallback_rack, rack_state)
             except Exception as e:
                 print(f"  [rack] error: {e} — fallback")
                 table_rack, should_insert = fallback_rack, True
@@ -459,9 +490,17 @@ def _process_pdf(file_path, file_name, company, device_family,
         for img_path in image_paths:
             print(f"  OCR page: {os.path.basename(img_path)}")
             page_context = extract_text_from_image(img_path)
- 
+
+            if not page_context.strip():
+                from ocr import PADDLE_AVAILABLE
+                if not PADDLE_AVAILABLE:
+                    print("  [WARNING] OCR text is empty AND PaddleOCR is not installed — this page cannot be processed at all. "
+                          "Install PaddleOCR (pip install paddleocr) to enable scanned-document support.")
+                else:
+                    print("  [OCR] No text recognised on this page — skipping.")
+                        
             try:
-                page_rack, should_insert = _resolve_table_rack(page_context, company, device_family, target_rack, fallback_rack)
+                page_rack, should_insert = _resolve_table_rack(page_context, company, device_family, target_rack, fallback_rack, rack_state)
             except Exception as e:
                 print(f"  [rack] error: {e} — fallback")
                 page_rack, should_insert = fallback_rack, True
@@ -473,8 +512,16 @@ def _process_pdf(file_path, file_name, company, device_family,
             rows     = extract_table_rows_from_image(img_path)
             reg_rows = filter_register_rows(rows)
             print(f"  {len(reg_rows)} candidate rows, rack='{page_rack}'")
-            total += _insert_rows_from_ocr(reg_rows, company, device_family, page_rack, doc_hash)
- 
+
+            if should_use_llm_fallback(page_context, len(reg_rows)):
+                print(f"  [hybrid] Cell parser yielded {len(reg_rows)} row(s) "
+                      f"for {len(page_context.strip())} chars of OCR text — "
+                      f"too sparse, falling back to LLM on raw text.")
+                llm_rows = extract_rows_via_llm(page_context, company, device_family, page_rack)
+                total += _insert_rows_from_llm_fallback(llm_rows, company, device_family, page_rack, doc_hash)
+            else:
+                total += _insert_rows_from_ocr(reg_rows, company, device_family, page_rack, doc_hash)
+
         for img_path in image_paths:
             try:
                 os.remove(img_path)
@@ -485,11 +532,20 @@ def _process_pdf(file_path, file_name, company, device_family,
  
  
 def _process_image(file_path, file_name, company, device_family, target_rack, fallback_rack, doc_hash) -> int:
+    rack_state = _new_rack_state()
     print("  Running OCR on image…")
     image_context = extract_text_from_image(file_path)
- 
+
+    if not image_context.strip():
+        from ocr import PADDLE_AVAILABLE
+        if not PADDLE_AVAILABLE:
+            print("  [WARNING] OCR text is empty AND PaddleOCR is not installed — this image cannot be processed at all. "
+                  "Install PaddleOCR (pip install paddleocr) to enable image OCR support.")
+        else:
+            print("  [OCR] No text recognised in this image.")
+    
     try:
-        img_rack, should_insert = _resolve_table_rack(image_context, company, device_family, target_rack, fallback_rack)
+        img_rack, should_insert = _resolve_table_rack(image_context, company, device_family, target_rack, fallback_rack, rack_state)
     except Exception as e:
         print(f"  [rack] error: {e} — fallback")
         img_rack, should_insert = fallback_rack, True
@@ -501,11 +557,19 @@ def _process_image(file_path, file_name, company, device_family, target_rack, fa
     rows     = extract_table_rows_from_image(file_path)
     reg_rows = filter_register_rows(rows)
     print(f"  {len(reg_rows)} candidate rows, rack='{img_rack}'")
+    if should_use_llm_fallback(image_context, len(reg_rows)):
+        print(f"  [hybrid] Cell parser yielded {len(reg_rows)} row(s) "
+              f"for {len(image_context.strip())} chars of OCR text — "
+              f"too sparse, falling back to LLM on raw text.")
+        llm_rows = extract_rows_via_llm(image_context, company, device_family, img_rack)
+        return _insert_rows_from_llm_fallback(llm_rows, company, device_family, img_rack, doc_hash)
+    
     return _insert_rows_from_ocr(reg_rows, company, device_family, img_rack, doc_hash)
  
  
 def _process_excel(file_path, file_name, company, device_family, target_rack, fallback_rack, doc_hash) -> int:
     total  = 0
+    rack_state = _new_rack_state()
     sheets = extract_excel(file_path)
  
     for sheet_name, df in sheets.items():
@@ -529,7 +593,7 @@ def _process_excel(file_path, file_name, company, device_family, target_rack, fa
         )
  
         try:
-            sheet_rack, should_insert = _resolve_table_rack(sheet_context, company, device_family, target_rack, fallback_rack)
+            sheet_rack, should_insert = _resolve_table_rack(sheet_context, company, device_family, target_rack, fallback_rack, rack_state)
         except Exception as e:
             print(f"  [rack] error: {e} — fallback")
             sheet_rack, should_insert = fallback_rack, True
@@ -546,6 +610,7 @@ def _process_excel(file_path, file_name, company, device_family, target_rack, fa
  
 def _process_docx(file_path, file_name, company, device_family, target_rack, fallback_rack, doc_hash) -> int:
     total = 0
+    rack_state = _new_rack_state()
     print("  Extracting tables from DOCX…")
     raw_tables    = extract_tables_from_docx(file_path)
     # No page_texts for DOCX — gap_text_before falls back to empty string
@@ -564,7 +629,7 @@ def _process_docx(file_path, file_name, company, device_family, target_rack, fal
             continue
  
         try:
-            table_rack, should_insert = _resolve_table_rack(context, company, device_family, target_rack, fallback_rack)
+            table_rack, should_insert = _resolve_table_rack(context, company, device_family, target_rack, fallback_rack, rack_state)
         except Exception as e:
             print(f"  [rack] error: {e} — fallback")
             table_rack, should_insert = fallback_rack, True
@@ -578,6 +643,7 @@ def _process_docx(file_path, file_name, company, device_family, target_rack, fal
         total += _insert_rows_from_table(df, roles, start, company, device_family, table_rack, doc_hash)
  
     return total
+
 
 ## main program
 def main():
@@ -600,74 +666,118 @@ def main():
     
     print(f"\nFiles: {[os.path.basename(f) for f in files]}\n")
 
-    files_to_process: list[tuple[str, str]] = []
-    cached_meta: dict | None = None
+    files_needing_full_extraction:   list[tuple[str, str]] = []  # (path, hash)
+    files_needing_rack_extraction:   list[tuple[str, str, dict]] = []  # (path, hash, cached_meta)
+    cached_meta: dict | None = None  # metadata from any already-seen file
  
     for file_path in files:
         doc_hash = _file_hash(file_path)
         existing = get_document(doc_hash)
  
-        if existing:
+        if existing is None:
+            # Never seen this file before
+            files_needing_full_extraction.append((file_path, doc_hash))
+        elif rack_already_extracted(doc_hash, user_rack):
+            # File seen AND this exact rack already extracted — pure cache hit
             print(f"  [cache] '{os.path.basename(file_path)}' already processed "
-                  f"({existing['processed_at']}) — skipping extraction.")
+                  f"for rack '{user_rack}' — skipping extraction.")
             cached_meta = existing
         else:
-            files_to_process.append((file_path, doc_hash))
+            # File seen but this rack is new — re-extract for this rack only
+            print(f"  [cache] '{os.path.basename(file_path)}' known file, "
+                  f"but rack '{user_rack}' not yet extracted — re-extracting.")
+            files_needing_rack_extraction.append((file_path, doc_hash, existing))
+            cached_meta = existing
  
-    # If every file was cached, go straight to retrieval using cached identity
-    if not files_to_process and cached_meta:
-        company       = cached_meta["company"]       or user_company  or "Unknown"
-        device_family = cached_meta["device_family"] or user_family   or "Unknown"
-        target_rack   = cached_meta["device_rack"]   or user_rack
-        fallback_rack = target_rack or device_family
-        print(f"\nAll files cached — using stored identity: "
-              f"{company} / {device_family} / rack='{target_rack}'")
+    #Determine company / device_family
+    # We always need these two values before extraction can run.
+    # They come from LLM only for brand-new files; for cached files we reuse
+    # the stored values and skip the LLM identification step entirely.
  
-    else:
-        # Identify device from the new files' text
-        new_paths = [fp for fp, _ in files_to_process]
+    if files_needing_full_extraction:
+        new_paths = [fp for fp, _ in files_needing_full_extraction]
         print("Collecting text for device identification…")
-        all_text      = _collect_all_text(new_paths)
-        company, device_family, device_rack = _run_llm_identification(all_text, user_company, user_family, user_rack)
- 
+        all_text = _collect_all_text(new_paths)
+        company, device_family, device_rack = _run_llm_identification(
+            all_text, user_company, user_family, user_rack)
         if not company:       company       = "Unknown"
         if not device_family: device_family = "Unknown"
         target_rack   = device_rack
         fallback_rack = target_rack or device_family
+        print(f"\nIdentified: {company} / {device_family} / "
+              f"rack='{target_rack or '(all)'}' ")
  
-        print(f"\nUsing: {company} / {device_family} / rack='{target_rack or '(all)'}'")
+    elif files_needing_rack_extraction or cached_meta:
+        # All files are known — reuse stored company/family
+        meta          = (files_needing_rack_extraction[0][2]
+                         if files_needing_rack_extraction else cached_meta)
+        company       = meta["company"]       or user_company  or "Unknown"
+        device_family = meta["device_family"] or user_family   or "Unknown"
+        target_rack   = user_rack
+        fallback_rack = target_rack or device_family
+        print(f"\nUsing cached identity: {company} / {device_family} / "
+              f"rack='{target_rack}'")
  
-        # Extract from new files
-        total_inserted = 0
+    else:
+        print("No files found to process.")
+        return
  
-        for file_path, doc_hash in files_to_process:
-            file_name = os.path.basename(file_path)
-            ext = file_name.lower().rsplit(".", 1)[-1]
-            global _last_known_rack
-            _last_known_rack = ""   # reset rack state per file
+    # Extract: brand-new files
+    total_inserted = 0
  
-            print(f"\n{'='*10}\nProcessing: {file_name}\n{'='*10}")
+    for file_path, doc_hash in files_needing_full_extraction:
+        file_name = os.path.basename(file_path)
+        ext       = file_name.lower().rsplit(".", 1)[-1]
  
-            if ext == "pdf":
-                n = _process_pdf(file_path, file_name, company, device_family, target_rack, fallback_rack, doc_hash)
-            elif ext in ("png", "jpg", "jpeg", "tiff", "bmp"):
-                n = _process_image(file_path, file_name, company, device_family, target_rack, fallback_rack, doc_hash)
-            elif ext in ("xlsx", "xls"):
-                n = _process_excel(file_path, file_name, company, device_family, target_rack, fallback_rack, doc_hash)
-            elif ext == "docx":
-                n = _process_docx(file_path, file_name, company, device_family, target_rack, fallback_rack, doc_hash)
-            else:
-                print(f"  Unsupported extension: .{ext}")
-                n = 0
+        print(f"\n{'='*10}\nProcessing (new): {file_name}\n{'='*10}")
  
-            if n > 0:
-                # Record this document as successfully processed
-                register_document(doc_hash, file_name, company, device_family, target_rack or device_family)
-            total_inserted += n
-
+        if ext == "pdf":
+            n = _process_pdf(file_path, file_name, company, device_family, target_rack, fallback_rack, doc_hash)
+        elif ext in ("png", "jpg", "jpeg", "tiff", "bmp"):
+            n = _process_image(file_path, file_name, company, device_family,  target_rack, fallback_rack, doc_hash)
+        elif ext in ("xlsx", "xls"):
+            n = _process_excel(file_path, file_name, company, device_family, target_rack, fallback_rack, doc_hash)
+        elif ext == "docx":
+            n = _process_docx(file_path, file_name, company, device_family, target_rack, fallback_rack, doc_hash)
+        else:
+            print(f"  Unsupported extension: .{ext}")
+            n = 0
+ 
+        if n > 0:
+            register_document(doc_hash, file_name, company, device_family,
+                              target_rack or device_family)
+        total_inserted += n
+ 
+    # Extract: known file, new rack
+    for file_path, doc_hash, meta in files_needing_rack_extraction:
+        file_name = os.path.basename(file_path)
+        ext       = file_name.lower().rsplit(".", 1)[-1]
+ 
+        print(f"\n{'='*10}\nRe-extracting (new rack '{target_rack}'): "
+              f"{file_name}\n{'='*10}")
+ 
+        if ext == "pdf":
+            n = _process_pdf(file_path, file_name, company, device_family, target_rack, fallback_rack, doc_hash)
+        elif ext in ("png", "jpg", "jpeg", "tiff", "bmp"):
+            n = _process_image(file_path, file_name, company, device_family, target_rack, fallback_rack, doc_hash)
+        elif ext in ("xlsx", "xls"):
+            n = _process_excel(file_path, file_name, company, device_family, target_rack, fallback_rack, doc_hash)
+        elif ext == "docx":
+            n = _process_docx(file_path, file_name, company, device_family, target_rack, fallback_rack, doc_hash)
+        else:
+            print(f"  Unsupported extension: .{ext}")
+            n = 0
+ 
+        if n > 0:
+            # Append the new rack to this document's extracted_racks list
+            register_document(doc_hash, file_name, company, device_family, target_rack)
+        total_inserted += n
+ 
+    # Report extraction results (only when extraction actually ran)
+    if files_needing_full_extraction or files_needing_rack_extraction:
         print(f"\n{'='*20}\nTotal rows inserted: {total_inserted}")
         if total_inserted == 0:
-            print("WARNING: Nothing extracted")             #run test_extractigon.py to debu
+            print("WARNING: Nothing extracted — check the extraction pipeline.")
             return
     
     retrieve_rack = target_rack if target_rack else fallback_rack
@@ -693,6 +803,8 @@ def main():
         address     = r["address"]
         datatype    = r["datatype"]
         description = r["description"]
+        scaling     = r.get("scaling")
+        num_registers = r.get("num_registers")
  
         if description.strip().lower() in header_patterns:
             continue
@@ -707,11 +819,13 @@ def main():
             "address":     address,
             "datatype":    datatype,
             "description": description,
+            "scaling":     scaling,
+            "num_registers": num_registers,
         })
  
     print(f"  {len(register_rows)} unique register(s) after dedup + header strip")
 
-    print("Formatting with LLM...")
+    print("Formatting deterministically")
     json_output = generate_json(register_rows, company, device_family)
  
     safe_rack = device_family.replace(" ", "_").replace("/", "_")

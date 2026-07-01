@@ -1,4 +1,5 @@
 import sqlite3
+import json
 from datetime import datetime, timezone
  
 DB_PATH = "modbus_store.db"
@@ -21,8 +22,9 @@ def init_db():
                 filename      TEXT NOT NULL,
                 company       TEXT,
                 device_family TEXT,
-                device_rack   TEXT,
-                processed_at  TEXT NOT NULL
+                extracted_racks TEXT NOT NULL DEFAULT '[]',
+                first_seen_at   TEXT NOT NULL,
+                last_updated_at TEXT NOT NULL
             )
         """)
  
@@ -38,11 +40,19 @@ def init_db():
                 address       TEXT    NOT NULL,
                 datatype      TEXT,
                 description   TEXT,
+                scaling       TEXT,
+                num_registers TEXT,
                 inserted_at   TEXT    NOT NULL,
                 UNIQUE(company, device_family, device_rack, doc_hash, address)
             )
         """)
- 
+
+        existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(registers_v2)").fetchall()} ##for tables stored wo scaling
+        if "scaling" not in existing_cols:
+            conn.execute("ALTER TABLE registers_v2 ADD COLUMN scaling TEXT")
+        if "num_registers" not in existing_cols:
+            conn.execute("ALTER TABLE registers_v2 ADD COLUMN num_registers TEXT")
+
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_reg_v2_lookup
             ON registers_v2(company, device_family, device_rack, doc_hash)
@@ -61,6 +71,8 @@ def init_db():
                 address,
                 datatype,
                 description,
+                scaling,
+                num_registers,
                 content='registers_v2',
                 content_rowid='id',
                 tokenize='porter ascii'
@@ -73,11 +85,11 @@ def init_db():
             AFTER INSERT ON registers_v2 BEGIN
                 INSERT INTO registers_fts(
                     rowid, company, device_family, device_rack,
-                    doc_hash, label, address, datatype, description)
+                    doc_hash, label, address, datatype, description, scaling, num_registers)
                 VALUES (
                     new.id, new.company, new.device_family, new.device_rack,
                     new.doc_hash, new.label, new.address,
-                    new.datatype, new.description);
+                    new.datatype, new.description, new.scaling, new.num_registers);
             END
         """)
  
@@ -86,11 +98,11 @@ def init_db():
             AFTER DELETE ON registers_v2 BEGIN
                 INSERT INTO registers_fts(
                     registers_fts, rowid, company, device_family, device_rack,
-                    doc_hash, label, address, datatype, description)
+                    doc_hash, label, address, datatype, description, scaling, num_registers)
                 VALUES (
                     'delete', old.id, old.company, old.device_family,
                     old.device_rack, old.doc_hash, old.label,
-                    old.address, old.datatype, old.description);
+                    old.address, old.datatype, old.description, old.scaling, old.num_registers);
             END
         """)
  
@@ -99,18 +111,18 @@ def init_db():
             AFTER UPDATE ON registers_v2 BEGIN
                 INSERT INTO registers_fts(
                     registers_fts, rowid, company, device_family, device_rack,
-                    doc_hash, label, address, datatype, description)
+                    doc_hash, label, address, datatype, description, scaling, num_registers)
                 VALUES (
                     'delete', old.id, old.company, old.device_family,
                     old.device_rack, old.doc_hash, old.label,
-                    old.address, old.datatype, old.description);
+                    old.address, old.datatype, old.description, old.scaling, old.num_registers);
                 INSERT INTO registers_fts(
                     rowid, company, device_family, device_rack,
-                    doc_hash, label, address, datatype, description)
+                    doc_hash, label, address, datatype, description, scaling, num_registers)
                 VALUES (
                     new.id, new.company, new.device_family, new.device_rack,
                     new.doc_hash, new.label, new.address,
-                    new.datatype, new.description);
+                    new.datatype, new.description, new.scaling, new.num_registers);
             END
         """)
  
@@ -119,62 +131,91 @@ def init_db():
  
 # Document registry
  
-def register_document(doc_hash: str, filename: str, company: str, device_family: str, device_rack: str):
-    with _get_conn() as conn:       # Record that a document has been fully processed
-        conn.execute("""
-            INSERT OR REPLACE INTO doc_registry
-                (doc_hash, filename, company, device_family, device_rack, processed_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (doc_hash, filename, company, device_family, device_rack,
-              datetime.now(timezone.utc).isoformat()))
+def register_document(doc_hash: str, filename: str, company: str, device_family: str, rack: str):
+    now = datetime.now(timezone.utc).isoformat()
+    with _get_conn() as conn:
+        existing = conn.execute(
+            "SELECT extracted_racks FROM doc_registry WHERE doc_hash=?",
+            (doc_hash,)
+        ).fetchone()
+ 
+        if existing is None:
+            racks = [rack] if rack else []
+            conn.execute("""
+                INSERT INTO doc_registry
+                    (doc_hash, filename, company, device_family,
+                     extracted_racks, first_seen_at, last_updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (doc_hash, filename, company, device_family,
+                  json.dumps(racks), now, now))
+        else:
+            racks = json.loads(existing[0])
+            if rack and rack not in racks:
+                racks.append(rack)
+            conn.execute("""
+                UPDATE doc_registry
+                SET extracted_racks=?, last_updated_at=?
+                WHERE doc_hash=?
+            """, (json.dumps(racks), now, doc_hash))
+ 
         conn.commit()
  
-def get_document(doc_hash: str) :  #"Return the registry row for this hash, or None if unseen."""
+def get_document(doc_hash: str) -> dict | None:
     with _get_conn() as conn:
-            row = conn.execute(
-                "SELECT filename, company, device_family, device_rack, processed_at "
-                "FROM doc_registry WHERE doc_hash = ?",
-                (doc_hash,)
-            ).fetchone()
+        row = conn.execute(
+            "SELECT filename, company, device_family, "
+            "extracted_racks, first_seen_at "
+            "FROM doc_registry WHERE doc_hash=?",
+            (doc_hash,)
+        ).fetchone()
     if row:
-            return {
-                "filename":      row[0],
-                "company":       row[1],
-                "device_family": row[2],
-                "device_rack":   row[3],
-                "processed_at":  row[4],
-            }
+        return {
+            "filename":        row[0],
+            "company":         row[1],
+            "device_family":   row[2],
+            "extracted_racks": json.loads(row[3]),
+            "first_seen_at":   row[4],
+        }
     return None
+
+def rack_already_extracted(doc_hash: str, rack: str) -> bool:
+    doc = get_document(doc_hash)
+    if not doc:
+        return False
+    norm = _norm_rack(rack)
+    return any(_norm_rack(r) == norm for r in doc["extracted_racks"])
  
+ 
+def _norm_rack(rack: str) -> str:
+    import re
+    return re.sub(r"[\s\-_]", "", rack.lower())
+
 # Register insert
  
-def insert_register_v2(company: str, device_family: str, device_rack: str,
-                        doc_hash: str, label: str, address: str, datatype: str, description: str):
+def insert_register_v2(company: str, device_family: str, device_rack: str, doc_hash: str, label: str, address: str, 
+                       datatype: str, description: str, scaling: str = None, num_registers: str = None):
     #Insert one register row.  Duplicate (same key + address) is silently ignore
     with _get_conn() as conn:
         conn.execute("""
             INSERT OR IGNORE INTO registers_v2
                 (company, device_family, device_rack, doc_hash,
-                 label, address, datatype, description, inserted_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 label, address, datatype, description, scaling, num_registers, inserted_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (company, device_family, device_rack, doc_hash,
-              label, address, datatype, description,
+              label, address, datatype, description, scaling, num_registers,
               datetime.now(timezone.utc).isoformat()))
         conn.commit()
- 
- 
-# ── Backward-compat shims ──────────────────────────────────────────────────────
+
+# Backward-compat shims
 # These keep any code that still imports the old names working.
 # insert_register() requires a doc_hash; callers in app.py already supply one.
 # For truly legacy callers that don't pass doc_hash we use a sentinel value.
  
 _LEGACY_HASH = "legacy"
  
-def insert_register(company, family, rack, label, address, datatype,
-                    description, doc_hash=_LEGACY_HASH):
+def insert_register(company, family, rack, label, address, datatype, description, doc_hash=_LEGACY_HASH, scaling = None, num_registers = None):
     """Shim: delegates to insert_register_v2."""
-    insert_register_v2(company, family, rack, doc_hash,
-                       label, address, datatype, description)
+    insert_register_v2(company, family, rack, doc_hash, label, address, datatype, description, scaling, num_registers)
  
  
 def clear_registers(company, family, rack):
@@ -208,7 +249,7 @@ def retrieve_registers_v2(company: str, device_family: str, device_rack: str, do
     with _get_conn() as conn:
         if doc_hash:
             rows = conn.execute("""
-                SELECT label, address, datatype, description, inserted_at
+                SELECT label, address, datatype, description, scaling, num_registers, inserted_at
                 FROM   registers_v2
                 WHERE  company=? AND device_family=? AND device_rack=?
                        AND doc_hash=?
@@ -217,9 +258,9 @@ def retrieve_registers_v2(company: str, device_family: str, device_rack: str, do
         else:
             # Window function: newest inserted_at wins per address
             rows = conn.execute("""
-                SELECT label, address, datatype, description, inserted_at
+                SELECT label, address, datatype, description, scaling, num_registers, inserted_at
                 FROM (
-                    SELECT label, address, datatype, description, inserted_at,
+                    SELECT label, address, datatype, description, scaling, num_registers, inserted_at,
                            ROW_NUMBER() OVER (
                                PARTITION BY address
                                ORDER BY inserted_at DESC
@@ -236,7 +277,9 @@ def retrieve_registers_v2(company: str, device_family: str, device_rack: str, do
             "address":      r[1],
             "datatype":     r[2],
             "description":  r[3],
-            "inserted_at":  r[4],
+            "scaling":      r[4],
+            "num_registers": r[5],
+            "inserted_at":   r[6],
         }
         for r in rows
     ]
@@ -248,8 +291,7 @@ def search_registers(query: str,
                      company: str | None = None,
                      device_family: str | None = None) -> list[dict]:
     """
-    BM25-ranked full-text search across all stored registers.
-    Optionally narrow by company and/or device_family.
+    BM25-ranked full-text search across all stored registers. Optionally narrow by company and/or device_family.
     Returns up to 200 results, best match first.
     """
     conditions = ["registers_fts MATCH ?"]
@@ -264,7 +306,7 @@ def search_registers(query: str,
  
     sql = f"""
         SELECT company, device_family, device_rack, doc_hash,
-               label, address, datatype, description,
+               label, address, datatype, description, scaling, num_registers,
                bm25(registers_fts) AS score
         FROM   registers_fts
         WHERE  {' AND '.join(conditions)}
@@ -284,7 +326,9 @@ def search_registers(query: str,
             "address":       r[5],
             "datatype":      r[6],
             "description":   r[7],
-            "score":         r[8],
+            "scaling":       r[8],
+            "num_registers": r[9],
+            "score":         r[10],
         }
         for r in rows
     ]

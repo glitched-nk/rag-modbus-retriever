@@ -2,14 +2,13 @@ import os
 import json
 from langchain_openai import ChatOpenAI
 
+# $env:OPENAI_API_KEY="key"  -> need to set in terminal
+
 def _get_llm():
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError(
-            "OPENAI_API_KEY is not set. "
-            "Run:  $env:OPENAI_API_KEY='sk-...'  (PowerShell) "
-            "or    set OPENAI_API_KEY=sk-...      (CMD) "
-            "in your terminal before starting the program."
+            "OPENAI_API_KEY is not set. Run:  $env:OPENAI_API_KEY='sk-...'  (PowerShell) "
         )
     return ChatOpenAI(api_key=api_key, model="gpt-4o-mini")
 
