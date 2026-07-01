@@ -1,6 +1,8 @@
 # Version-aware retrieval: different doc versions coexist; newest wins per address when doc_hash=None, or pinned to a specific hash.
 # FTS5 full-text search index maintained automatically via SQL triggers; search_registers() in database.py is the public search interface.
 
+#.\venv\Scripts\Activate.ps1
+
 import os
 import re
 import pandas as pd
